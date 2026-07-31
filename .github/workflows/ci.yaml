@@ -1,5 +1,10 @@
 name: CI/CD
 
+# Least-privilege default for the workflow's GITHUB_TOKEN (CKV2_GHA_1);
+# jobs that need more elevate explicitly (release: contents write).
+permissions:
+  contents: read
+
 on:
   push:
     branches:
