@@ -43,6 +43,7 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           curl -fsSL -o "$HOME/.local/bin/tfsec" \
             https://github.com/aquasecurity/tfsec/releases/download/v1.28.14/tfsec-linux-amd64
+          echo "a32d0799bbefababaa4fcd814da9f4d251cd932789590b99d1d5fcb89ace6f68  $HOME/.local/bin/tfsec" | sha256sum -c -
           chmod +x "$HOME/.local/bin/tfsec"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -134,6 +135,13 @@ jobs:
         run: |
           git fetch --tags --force --quiet
           LATEST_VERSION="$(git describe --tags --abbrev=0)"
+          # Tag names are attacker-influenceable and are later interpolated
+          # into sed expressions that write into infrastructure-modules —
+          # require strict semver before using the value anywhere
+          if ! [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Latest tag '$LATEST_VERSION' is not strict semver — refusing to proceed."
+            exit 1
+          fi
           PREVIOUS_VERSION="$(git describe --abbrev=0 --tags "$(git rev-list --tags --skip=1 --max-count=1)")"
           echo "Latest tag version: $LATEST_VERSION (previous: $PREVIOUS_VERSION)"
           current=(${LATEST_VERSION//./ })
