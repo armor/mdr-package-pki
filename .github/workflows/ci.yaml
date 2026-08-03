@@ -189,7 +189,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
           GH_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
         run: |
-          set -x
+          # No shell tracing: this is a public repo, so Actions logs are
+          # world-readable — keep output to the deliberate echoes only.
+          set -e
           git config --global user.email "ci@quantum.security"
           git config --global user.name "Quantum CI Bot"
           git clone "git@github.com:quantum-sec/${TARGET_REPOSITORY}.git"
