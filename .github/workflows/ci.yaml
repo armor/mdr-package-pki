@@ -1,7 +1,8 @@
 name: CI/CD
 
-# Least-privilege default for the workflow's GITHUB_TOKEN (CKV2_GHA_1);
-# jobs that need more elevate explicitly (release: contents write).
+# Least-privilege default for the workflow's GITHUB_TOKEN; jobs that need
+# more elevate explicitly. Pipeline logic lives in quantum-sec/actions
+# (version-pinned) — converges onto armor/actions at org-move time.
 permissions:
   contents: read
 
@@ -18,216 +19,29 @@ on:
       - main
 
 jobs:
-  pre-commit:
-    name: Pre-Commit Validation
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Read Terraform version
-        id: tf-version
-        run: echo "version=$(cat .terraform-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ steps.tf-version.outputs.version }}
-          terraform_wrapper: false
-
-      - name: Setup tflint
-        uses: terraform-linters/setup-tflint@v4
-
-      - name: Install tfsec
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o "$HOME/.local/bin/tfsec" \
-            https://github.com/aquasecurity/tfsec/releases/download/v1.28.14/tfsec-linux-amd64
-          echo "a32d0799bbefababaa4fcd814da9f4d251cd932789590b99d1d5fcb89ace6f68  $HOME/.local/bin/tfsec" | sha256sum -c -
-          chmod +x "$HOME/.local/bin/tfsec"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Run pre-commit
-        run: |
-          pip install pre-commit
-          pre-commit run --all-files
-
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: .
-          quiet: true
-          soft_fail: true
+  validation:
+    name: Validation
+    uses: quantum-sec/actions/.github/workflows/terraform-module-validation.yaml@v1.0.0
 
   release:
     name: Release
-    needs: [pre-commit, validate]
+    needs: validation
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      semver: ${{ steps.version.outputs.semver }}
-      new_release: ${{ steps.version.outputs.new_release }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GIT_TOKEN_BASIC }}
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run semantic-release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
-        run: npx semantic-release --ci false
-
-      - name: Extract version
-        id: version
-        run: |
-          SEMVER="$(git tag --points-at HEAD --sort=-v:refname | head -1)"
-          if [ -n "$SEMVER" ]; then
-            echo "semver=$SEMVER" >> "$GITHUB_OUTPUT"
-            echo "new_release=true" >> "$GITHUB_OUTPUT"
-            echo "New release: $SEMVER"
-          else
-            echo "new_release=false" >> "$GITHUB_OUTPUT"
-            echo "No new release created."
-          fi
+    uses: quantum-sec/actions/.github/workflows/semantic-release.yaml@v1.0.0
+    secrets:
+      GIT_TOKEN_BASIC: ${{ secrets.GIT_TOKEN_BASIC }}
 
   update-infrastructure-modules:
     name: Update infrastructure-modules references
     needs: release
-    if: needs.release.outputs.new_release == 'true'
-    runs-on: ubuntu-latest
-    env:
-      PACKAGE_NAME: package-pki
-      TARGET_REPOSITORY: infrastructure-modules
-      DEFAULT_BRANCH: master
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GIT_TOKEN_BASIC }}
-          fetch-depth: 0
-
-      - name: Determine version change
-        # Port of pipeline-library's verify-version-changed.yml
-        run: |
-          git fetch --tags --force --quiet
-          LATEST_VERSION="$(git describe --tags --abbrev=0)"
-          # Tag names are attacker-influenceable and are later interpolated
-          # into sed expressions that write into infrastructure-modules —
-          # require strict semver before using the value anywhere
-          if ! [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Latest tag '$LATEST_VERSION' is not strict semver — refusing to proceed."
-            exit 1
-          fi
-          PREVIOUS_VERSION="$(git describe --abbrev=0 --tags "$(git rev-list --tags --skip=1 --max-count=1)")"
-          echo "Latest tag version: $LATEST_VERSION (previous: $PREVIOUS_VERSION)"
-          current=(${LATEST_VERSION//./ })
-          previous=(${PREVIOUS_VERSION//./ })
-          if [ "${current[0]}" -gt "${previous[0]}" ]; then
-            VERSION_CHANGED=major
-          elif [ "${current[1]}" -gt "${previous[1]}" ]; then
-            VERSION_CHANGED=minor
-          elif [ "${current[2]}" -gt "${previous[2]}" ]; then
-            VERSION_CHANGED=patch
-          else
-            VERSION_CHANGED=same
-          fi
-          echo "Version change: $VERSION_CHANGED"
-          echo "LATEST_VERSION=$LATEST_VERSION" >> "$GITHUB_ENV"
-          echo "VERSION_CHANGED=$VERSION_CHANGED" >> "$GITHUB_ENV"
-
-      - name: Import GPG key
-        env:
-          GPG_KEY_BASE64: ${{ secrets.IMPORT_GPG_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.IMPORT_GPG_KEY_PASSPHRASE }}
-        run: |
-          echo "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
-          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient ci@quantum.security > temp.encrypted
-          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
-          rm -f temp.encrypted
-          git config --global user.signingkey "5DEFE5F42550F28A17F9B83AC7E6D88B99BC6D9D"
-          git config --global commit.gpgsign true
-
-      - name: Setup SSH key
-        env:
-          SSH_KEY: ${{ secrets.QUANTUM_CI_BOT_GITHUB_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-      - name: Update source references
-        # Port of pipeline-library's update-source-reference.yml: rewrite this
-        # package's ?ref= pins in infrastructure-modules to the new version.
-        # Minor/patch bumps push directly to the default branch (GPG-signed);
-        # major bumps go via a feature branch + PR.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
-          GH_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
-        run: |
-          # No shell tracing: this is a public repo, so Actions logs are
-          # world-readable — keep output to the deliberate echoes only.
-          set -e
-          git config --global user.email "ci@quantum.security"
-          git config --global user.name "Quantum CI Bot"
-          git clone "git@github.com:quantum-sec/${TARGET_REPOSITORY}.git"
-          pushd "./${TARGET_REPOSITORY}"
-          current=(${LATEST_VERSION//./ })
-          current_major="${current[0]}"
-          echo "Checking if major version in the tf changed"
-          if ! grep -q --include=*.tf --include=*.hcl -rio "${PACKAGE_NAME}\.git.*ref=[^${current_major}]\." .; then
-            echo "No major version change detected in any of the tf or hcl files"
-            major_version_changed=false
-          else
-            echo "Major version has been detected in one or more of the tf or hcl files"
-            major_version_changed=true
-            branch="feature/${PACKAGE_NAME}"
-            git checkout $branch && git pull || git checkout -b $branch
-          fi
-          echo "Searching: ${PACKAGE_NAME}"
-          find ./ -name "*.tf" -type f -exec sed -i "/${PACKAGE_NAME}\.git/ s/\?ref=.*/\?ref=${LATEST_VERSION}\"/" {} \;
-          find ./ -name "*.hcl" -type f -exec sed -i "/${PACKAGE_NAME}\.git/ s/\?ref=.*/\?ref=${LATEST_VERSION}\"/" {} \;
-          git diff
-          git add .
-          git commit -m "Update ${PACKAGE_NAME} references to ${LATEST_VERSION} (${VERSION_CHANGED})"
-          if $major_version_changed
-          then
-            echo "Major version has been changed, creating a pr request"
-            git push origin $branch
-            pr_number=$(gh pr list --json title --json number --json state --jq '.[] | select((.title | startswith("Update ${PACKAGE_NAME} references")) and (.state == "OPEN")) | .number')
-            pr_title="Update ${PACKAGE_NAME} references to ${LATEST_VERSION}"
-            pr_body="- [x] Update references to [${PACKAGE_NAME}](https://github.com/quantum-sec/${PACKAGE_NAME}) to refer to the latest release ([${LATEST_VERSION}](https://github.com/quantum-sec/${PACKAGE_NAME}/releases/tag/${LATEST_VERSION}))"
-            if [ -z "$pr_number" ]; then
-              gh pr create --title "$pr_title" --body "$pr_body"
-            else
-              gh pr edit "$pr_number" --title "$pr_title" --body "$pr_body"
-            fi
-          else
-            echo "Major version was not changed, merging to ${DEFAULT_BRANCH}"
-            git push origin ${DEFAULT_BRANCH}
-          fi
-          popd
+    if: needs.release.outputs.semver != ''
+    uses: quantum-sec/actions/.github/workflows/update-source-reference.yaml@v1.0.0
+    with:
+      package_name: package-pki
+    secrets:
+      GIT_TOKEN_BASIC: ${{ secrets.GIT_TOKEN_BASIC }}
+      IMPORT_GPG_KEY: ${{ secrets.IMPORT_GPG_KEY }}
+      IMPORT_GPG_KEY_PASSPHRASE: ${{ secrets.IMPORT_GPG_KEY_PASSPHRASE }}
+      QUANTUM_CI_BOT_GITHUB_SSH_KEY: ${{ secrets.QUANTUM_CI_BOT_GITHUB_SSH_KEY }}
