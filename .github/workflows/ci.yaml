@@ -11,17 +11,24 @@ on:
     branches:
       - master
       - main
-      - feature/*
-      - fix/*
   pull_request:
     branches:
       - master
       - main
 
+# Serialize runs per ref so two default-branch pushes never race two
+# release jobs. The in-progress run always completes; a pending run
+# superseded by a newer push is replaced by it (safe here: releases are
+# cumulative and validation scans the full tree, so the surviving run
+# covers the replaced one's content).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   validation:
     name: Validation
-    uses: quantum-sec/actions/.github/workflows/terraform-module-validation.yaml@v1.0.0
+    uses: quantum-sec/actions/.github/workflows/terraform-module-validation.yaml@v1
 
   release:
     name: Release
@@ -29,7 +36,7 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     permissions:
       contents: write
-    uses: quantum-sec/actions/.github/workflows/semantic-release.yaml@v1.0.0
+    uses: quantum-sec/actions/.github/workflows/semantic-release.yaml@v1.4.0
     secrets:
       GIT_TOKEN_BASIC: ${{ secrets.GIT_TOKEN_BASIC }}
 
@@ -37,7 +44,7 @@ jobs:
     name: Update infrastructure-modules references
     needs: release
     if: needs.release.outputs.semver != ''
-    uses: quantum-sec/actions/.github/workflows/update-source-reference.yaml@v1.0.0
+    uses: quantum-sec/actions/.github/workflows/update-source-reference.yaml@v1.4.0
     with:
       package_name: package-pki
     secrets:
